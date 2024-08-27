@@ -36,3 +36,4 @@ SQLAlchemy==1.4.52
 statsd==4.0.1
 # Watchtower
 watchtower==3.2.0
+py-spy==0.3.14

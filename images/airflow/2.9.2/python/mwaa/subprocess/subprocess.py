@@ -20,6 +20,7 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 
 # Our imports
 from mwaa.logging.loggers import CompositeLogger
@@ -88,6 +89,7 @@ class Subprocess:
 
         self.start_time: float | None = None
         self.process: Popen[Any] | None = None
+        self.log_thread = None
 
         self.is_shut_down = False
 
@@ -148,6 +150,7 @@ class Subprocess:
           useful if the caller wants to run multiple sub-processes and have them run in
           parallel.
         """
+        module_logger.info(f"Starting process {self.cmd}")
 
         # Initialize process conditions if any.
         for condition in self.conditions:
@@ -161,15 +164,17 @@ class Subprocess:
             # Stop the process at exit.
             atexit.register(self.shutdown)
 
-            self.process_status = ProcessStatus.RUNNING_WITH_NO_LOG_READ
+            self.process_status = ProcessStatus.RUNNING
 
+            self.log_thread = threading.Thread(target=self._read_subprocess_log_stream, args=(self.process,))
             if auto_enter_execution_loop:
+                self.log_thread.start()
+                start_time = time.time()
                 while self.execution_loop_iter():
-                    if self.process_status == ProcessStatus.RUNNING_WITH_NO_LOG_READ:
-                        # There are no pending logs in the process, so we sleep for a while
-                        # to avoid getting into a continuous execution that spikes the CPU
-                        # and impacts the Airflow process.
-                        time.sleep(1)
+                    dt = time.time() - start_time
+                    time.sleep(max(1.0 - dt, 0))
+                    start_time = time.time()
+                self.log_thread.join()
         except Exception as ex:
             module_logger.fatal(
                 "Unexpected error occurred while trying to start a process "
@@ -187,6 +192,23 @@ class Subprocess:
 
         return failed_conditions
 
+    def _read_subprocess_log_stream(self, process):
+        stream = process.stdout
+        while True:
+            if not stream or stream.closed:
+                break
+            line = stream.readline()
+            if line == b"":
+                if process.poll() is not None:
+                    break
+                else:
+                    time.sleep(0.05)
+            else:
+                self.process_logger.info(line.decode("utf-8"))
+    
+    def _get_subprocess_status(self, process: Popen[Any]):
+        return ProcessStatus.RUNNING if process.poll() is None else ProcessStatus.FINISHED
+
     def execution_loop_iter(self):
         """
         Execute a single iteration of the execution loop.
@@ -203,23 +225,18 @@ class Subprocess:
             # Process is not running anymore.
             return False
 
-        if self.process_status == ProcessStatus.FINISHED_WITH_NO_MORE_LOGS:
-            # The process has finished and there are no more logs to read so we
+        if self.process_status == ProcessStatus.FINISHED:
+            # The process has finished.
             # just return False so the caller stop looping.
             return False
 
-        self.process_status = self._capture_output_line_from_process(self.process)
+        self.process_status = self._get_subprocess_status(self.process)
 
-        process_completed_and_logs_processed = (
-            self.process_status == ProcessStatus.FINISHED_WITH_NO_MORE_LOGS
-        )
-
-        if process_completed_and_logs_processed:
+        if self.process_status == ProcessStatus.FINISHED:
             # We are done; call shutdown to ensure that we free all resources.
             self.shutdown()
         elif self.process_status in [
-            ProcessStatus.RUNNING_WITH_NO_LOG_READ,
-            ProcessStatus.RUNNING_WITH_LOG_READ,
+            ProcessStatus.RUNNING
         ]:
             # The process is still running, so we need to check conditions.
             failed_conditions = self._check_process_conditions()
@@ -233,10 +250,10 @@ class Subprocess:
 """.strip()
                 )
                 self.shutdown()
-                self.process_status = ProcessStatus.FINISHED_WITH_NO_MORE_LOGS
-                process_completed_and_logs_processed = True
+                self.process_status = ProcessStatus.FINISHED
+                return False
 
-        return not process_completed_and_logs_processed
+        return True
 
     def _create_python_subprocess(self) -> Popen[Any]:
         module_logger.info(f"Starting new subprocess for command '{self.cmd}'...")
@@ -262,31 +279,6 @@ class Subprocess:
         )
         return process
 
-    def _capture_output_line_from_process(self, process: Popen[Any]):
-        """
-        Read log lines from the Airflow process and upload them to CloudWatch.
-
-        :param process: The process to read lines from.
-
-        :return: The process status. See ProcessStatus enum for the possible values.
-        """
-        line = b""
-        if process.stdout and not process.stdout.closed:
-            line = process.stdout.readline()
-        process_finished = process.poll() is not None
-        if line == b"" and process_finished:
-            return ProcessStatus.FINISHED_WITH_NO_MORE_LOGS
-        if line:
-            # Send the log to the logger.
-            self.process_logger.info(line.decode("utf-8"))
-            return (
-                ProcessStatus.FINISHED_WITH_LOG_READ
-                if process_finished
-                else ProcessStatus.RUNNING_WITH_LOG_READ
-            )
-        else:
-            return ProcessStatus.RUNNING_WITH_NO_LOG_READ
-
     def shutdown(self):
         """Stop and close the subprocess and its resources."""
         if self.is_shut_down:
@@ -295,8 +287,7 @@ class Subprocess:
         self.is_shut_down = True
 
         if self.process and self.process_status in [
-            ProcessStatus.RUNNING_WITH_NO_LOG_READ,
-            ProcessStatus.RUNNING_WITH_LOG_READ,
+            ProcessStatus.RUNNING
         ]:
             self._shutdown_python_subprocess(self.process)
         self.process = None
@@ -358,19 +349,14 @@ def run_subprocesses(
     all_processes = subprocesses + essential_subprocesses
     for s in all_processes:
         s.start(False)  # False since we want to run the subprocesses in parallel
+        s.log_thread.start()
     running_processes = all_processes
-    read_some_logs = True
     while len(running_processes) > 0:
-        read_some_logs = False
+        start_time = time.time()
         finished_processes: List[Subprocess] = []
         for s in running_processes:
             if not s.execution_loop_iter():
                 finished_processes.append(s)
-            if s.process_status in [
-                ProcessStatus.FINISHED_WITH_LOG_READ,
-                ProcessStatus.RUNNING_WITH_LOG_READ,
-            ]:
-                read_some_logs = True
 
         # Remove finished processes from the list of running processes.
         running_processes = [s for s in running_processes if s not in finished_processes]
@@ -388,11 +374,11 @@ def run_subprocesses(
             for s in running_processes:
                 s.shutdown()
             break
+        dt = time.time() - start_time
+        time.sleep(max(1.0 - dt, 0))
+    for s in all_processes:
+        s.log_thread.join()
 
-        if not read_some_logs:
-            # We didn't read any logs from any process. Sleep for a bit so we don't
-            # enter into a tight loop that spikes the CPU.
-            time.sleep(1)
 
 
 def _sigterm_handler(signal: int, frame: Optional[FrameType]):

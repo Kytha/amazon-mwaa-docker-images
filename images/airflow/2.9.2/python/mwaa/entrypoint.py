@@ -554,6 +554,7 @@ def _create_airflow_scheduler_subprocesses(environ: Dict[str, str], conditions: 
     :param conditions: A list of subprocess conditions.
     :returns: Scheduler subprocesses.
     """
+    profiler = Subprocess(cmd=['python3', '/python/mwaa/debug/airflow_profiler.py'], env=environ)
     return [
             create_airflow_subprocess(
                 [airflow_cmd],
@@ -567,7 +568,7 @@ def _create_airflow_scheduler_subprocesses(environ: Dict[str, str], conditions: 
                 ("dag-processor", DAG_PROCESSOR_LOGGER_NAME, "dag-processor"),
                 ("triggerer", TRIGGERER_LOGGER_NAME, "triggerer"),
             ]
-        ]
+        ] + [profiler]
 
 
 def _create_airflow_process_conditions(airflow_cmd: str):
@@ -602,12 +603,13 @@ def run_airflow_command(cmd: str, environ: Dict[str, str]):
             subprocesses = _create_airflow_scheduler_subprocesses(environ, conditions)
             # Schedulers, triggers, and DAG processors are all essential processes and
             # if any fails, we want to exit the container and let it restart.
-            run_subprocesses(subprocesses, essential_subprocesses=subprocesses)
+            run_subprocesses([], essential_subprocesses=subprocesses)
 
         case "worker":
-            run_subprocesses(_create_airflow_worker_subprocesses(environ))
+            run_subprocesses([],_create_airflow_worker_subprocesses(environ))
         case "webserver":
             run_subprocesses(
+                [],
                 [
                     create_airflow_subprocess(
                         ["webserver"],

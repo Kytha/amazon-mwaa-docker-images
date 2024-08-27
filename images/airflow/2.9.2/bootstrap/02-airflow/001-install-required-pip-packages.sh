@@ -16,6 +16,7 @@ REQUIRED_PACKAGES=(
     pycurl
     watchtower
     virtualenv
+    py-spy
 )
 
 # safe-pip-install always install all required packages, along with whatever
